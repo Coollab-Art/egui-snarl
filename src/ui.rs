@@ -1238,7 +1238,10 @@ where
         snarl_state.look_at(nodes_bb, ui_rect, min_scale, max_scale);
     }
 
-    if modifiers.command && snarl_resp.clicked_by(PointerButton::Primary) {
+    // Coollab: plain click on empty canvas deselects everything.
+    // (Upstream only did this on ctrl+click; we widened it so clicking the
+    // background behaves like most other editors.)
+    if snarl_resp.clicked_by(PointerButton::Primary) {
         snarl_state.deselect_all_nodes();
     }
 
@@ -1876,11 +1879,20 @@ where
         node_moved = Some((node, r.drag_delta()));
     }
 
+    // Coollab: "normal" selection behaviour.
+    // - Plain click/drag: select this node only (replace current selection).
+    // - Ctrl+click: toggle this node's membership in the selection.
+    // - Clicking empty canvas leaves the selection untouched (see the block
+    //   above where the ctrl+click-canvas deselect was removed).
     if r.clicked_by(PointerButton::Primary) || r.dragged_by(PointerButton::Primary) {
-        if modifiers.shift {
-            snarl_state.select_one_node(modifiers.command, node);
-        } else if modifiers.command {
-            snarl_state.deselect_one_node(node);
+        if modifiers.command {
+            if snarl_state.selected_nodes().contains(&node) {
+                snarl_state.deselect_one_node(node);
+            } else {
+                snarl_state.select_one_node(false, node);
+            }
+        } else {
+            snarl_state.select_one_node(true, node);
         }
     }
 
