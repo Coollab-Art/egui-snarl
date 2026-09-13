@@ -1833,20 +1833,6 @@ where
     // Rect for node + frame margin.
     let node_frame_rect = node_rect + node_frame.total_margin();
 
-    if snarl_state.selected_nodes().contains(&node) {
-        let select_style = style.get_select_style(ui.style());
-
-        let select_rect = node_frame_rect + select_style.margin;
-
-        ui.painter().rect(
-            select_rect,
-            select_style.rounding,
-            select_style.fill,
-            select_style.stroke,
-            StrokeKind::Inside,
-        );
-    }
-
     // Size of the pin.
     // Side of the square or diameter of the circle.
     let pin_size = style.get_pin_size(ui.style()).max(0.0);
@@ -1929,6 +1915,28 @@ where
     let r = node_frame.show(node_ui, |ui| {
         if viewer.has_node_style(node, &inputs, &outputs, snarl) {
             viewer.apply_node_style(ui.style_mut(), node, &inputs, &outputs, snarl);
+        }
+
+        // Coollab: the selection indicator is a stroke on the node's own rect
+        // and corner radius, with `StrokeKind::Middle` so its inner half covers
+        // the node's AA edge and its outer half is the visible halo. Upstream
+        // instead painted a second, larger filled rect *behind* the node, which
+        // leaves a sliver at the rounded corners. Drawing it here - inside
+        // `node_frame.show`, before any pin or body content - keeps it above the
+        // node fill while letting pins render on top of it. The painter takes a
+        // wide clip rect because the stroke's outer half falls outside the ui's
+        // own clip. `SelectionStyle`'s `fill`, `margin` and `rounding` are
+        // deliberately unused: the geometry comes from the node itself so the
+        // two shapes cannot diverge, and only `stroke` is read.
+        if snarl_state.selected_nodes().contains(&node) {
+            let select_style = style.get_select_style(ui.style());
+            let painter = ui.painter().clone().with_clip_rect(ui.ctx().content_rect());
+            painter.rect_stroke(
+                node_frame_rect.round_ui(),
+                node_frame.corner_radius,
+                select_style.stroke,
+                StrokeKind::Middle,
+            );
         }
 
         // Input pins' center side by X axis.
