@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use egui::{
     Align, Color32, CornerRadius, Frame, Id, LayerId, Layout, Margin, Modifiers, PointerButton,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo,
-    Vec2,
+    Pos2, Rangef, Rect, Response, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind,
+    UiStackInfo, Vec2,
     collapsing_header::paint_default_icon,
     emath::{GuiRounding, TSTransform},
     epaint::Shadow,
@@ -391,6 +391,17 @@ pub struct SnarlStyle {
     )]
     pub pin_size: Option<f32>,
 
+    /// How far a pin's interaction area extends beyond the shape that is drawn,
+    /// in points. Grabbing a wire is a precision task that a pin sized for
+    /// legibility makes needlessly hard, so the hit area can be grown without
+    /// growing the pin. Defaults to `0.0`.
+    #[cfg_attr(feature = "egui-probe", egui_probe(range = 0.0..))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub pin_hit_expansion: Option<f32>,
+
     /// Default fill color for pins.
     #[cfg_attr(
         feature = "serde",
@@ -574,6 +585,10 @@ impl SnarlStyle {
         self.pin_size.unwrap_or(style.spacing.interact_size.y * 0.6)
     }
 
+    fn get_pin_hit_expansion(&self) -> f32 {
+        self.pin_hit_expansion.unwrap_or(0.0)
+    }
+
     fn get_pin_fill(&self, style: &Style) -> Color32 {
         self.pin_fill
             .unwrap_or(style.visuals.widgets.active.bg_fill)
@@ -753,6 +768,7 @@ impl SnarlStyle {
         SnarlStyle {
             node_layout: None,
             pin_size: None,
+            pin_hit_expansion: None,
             pin_fill: None,
             pin_stroke: None,
             pin_shape: None,
@@ -989,9 +1005,12 @@ where
     clamp_scale(&mut to_global, min_scale, max_scale, ui_rect);
 
     let mut snarl_resp = ui.response();
-    Scene::new()
-        .zoom_range(min_scale..=max_scale)
-        .register_pan_and_zoom(&ui, &mut snarl_resp, &mut to_global);
+    register_pan_and_zoom(
+        &ui,
+        &mut snarl_resp,
+        &mut to_global,
+        Rangef::new(min_scale, max_scale),
+    );
 
     if snarl_resp.changed() {
         ui.ctx().request_repaint();
@@ -1030,27 +1049,30 @@ where
     let mut node_moved = None;
     let mut node_to_top = None;
 
-    // Process selection rect.
+    // Process selection rect. Dragging the empty canvas with the primary button
+    // is what draws it - no modifier, because the primary button no longer pans
+    // (see `register_pan_and_zoom`). Shift still means "add to the selection".
+    //
+    // The background's own response, not a dedicated widget over it: an extra
+    // widget spanning the canvas becomes the topmost thing under the pointer and
+    // takes the background's `hovered`, which the right-click graph menu and the
+    // dropped-wire menu both need. Nodes and pins are drawn after this and stay
+    // on top, so they still win the drag.
     let mut rect_selection_ended = None;
-    if modifiers.shift || snarl_state.is_rect_selection() {
-        let select_resp = ui.interact(snarl_resp.rect, snarl_id.with("select"), Sense::drag());
-
-        if select_resp.dragged_by(PointerButton::Primary)
-            && let Some(pos) = select_resp.interact_pointer_pos()
-        {
-            if snarl_state.is_rect_selection() {
-                snarl_state.update_rect_selection(pos);
-            } else {
-                snarl_state.start_rect_selection(pos);
-            }
+    if snarl_resp.dragged_by(PointerButton::Primary)
+        && let Some(pos) = snarl_resp.interact_pointer_pos()
+    {
+        if snarl_state.is_rect_selection() {
+            snarl_state.update_rect_selection(pos);
+        } else {
+            snarl_state.start_rect_selection(pos);
         }
-
-        if select_resp.drag_stopped_by(PointerButton::Primary) {
-            if let Some(select_rect) = snarl_state.rect_selection() {
-                rect_selection_ended = Some(select_rect);
-            }
-            snarl_state.stop_rect_selection();
+    }
+    if snarl_resp.drag_stopped_by(PointerButton::Primary) {
+        if let Some(select_rect) = snarl_state.rect_selection() {
+            rect_selection_ended = Some(select_rect);
         }
+        snarl_state.stop_rect_selection();
     }
 
     let wire_frame_size = style.get_wire_frame_size(ui.style());
@@ -1487,10 +1509,15 @@ where
                 pin_size,
             );
 
-            // Interact with pin shape.
+            // Interact with pin shape. The hit area can be larger than the
+            // shape, so the drawn rect is used for everything visual.
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            let r = pin_ui.interact(
+                pin_rect.expand(style.get_pin_hit_expansion()),
+                pin_ui.next_auto_id(),
+                Sense::click_and_drag(),
+            );
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1524,7 +1551,7 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_in() {
@@ -1545,7 +1572,7 @@ where
             input_positions.insert(
                 in_pin.id,
                 PinResponse {
-                    pos: r.rect.center(),
+                    pos: pin_rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                 },
@@ -1647,9 +1674,15 @@ where
                 pin_size,
             );
 
+            // The hit area can be larger than the shape, so the drawn rect is
+            // used for everything visual.
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            let r = pin_ui.interact(
+                pin_rect.expand(style.get_pin_hit_expansion()),
+                pin_ui.next_auto_id(),
+                Sense::click_and_drag(),
+            );
 
             pin_ui.skip_ahead_auto_ids(1);
 
@@ -1684,7 +1717,7 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_out() {
@@ -1705,7 +1738,7 @@ where
             output_positions.insert(
                 out_pin.id,
                 PinResponse {
-                    pos: r.rect.center(),
+                    pos: pin_rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                 },
@@ -2595,6 +2628,67 @@ impl<T> Snarl<T> {
             ui,
         );
     }
+}
+
+/// Navigate the canvas: wheel to zoom, drag to pan.
+///
+/// Replaces `egui::Scene::register_pan_and_zoom`, which maps the plain wheel to
+/// a pan and puts zoom behind the ctrl modifier, and pans on a primary drag -
+/// the gesture a node graph wants for rubber-band selection. Here the primary
+/// button is left free, and only the middle and secondary buttons pan.
+///
+/// The wheel modifiers egui already applies are left alone: shift makes the
+/// wheel horizontal and alt makes it vertical (`InputOptions`), so a modified
+/// wheel arrives as a scroll delta and pans, while an unmodified one zooms
+/// around the pointer. Ctrl still zooms, via egui's own `zoom_delta`.
+fn register_pan_and_zoom(ui: &Ui, resp: &mut Response, to_global: &mut TSTransform, zoom: Rangef) {
+    if resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary) {
+        to_global.translation += to_global.scaling * resp.drag_delta();
+        resp.mark_changed();
+    }
+
+    let Some(mouse_pos) = ui.input(|i| i.pointer.latest_pos()) else {
+        return;
+    };
+    if !resp.contains_pointer() {
+        return;
+    }
+
+    let (mut zoom_delta, mut pan_delta, modifiers) =
+        ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta(), i.modifiers));
+
+    // An unmodified wheel is a zoom, so the scroll it produced must not also pan.
+    if modifiers.is_none() {
+        let speed = ui
+            .ctx()
+            .options(|options| options.input_options.scroll_zoom_speed);
+        zoom_delta *= (speed * (pan_delta.x + pan_delta.y)).exp();
+        pan_delta = Vec2::ZERO;
+    }
+
+    // Early out so floating-point drift doesn't nudge the transform every frame.
+    if zoom_delta == 1.0 && pan_delta == Vec2::ZERO {
+        return;
+    }
+
+    if zoom_delta != 1.0 {
+        let pointer_in_scene = to_global.inverse() * mouse_pos;
+        // `max` because a transform restored from outside this range would
+        // otherwise give an inverted clamp, which panics.
+        let smallest = zoom.min / to_global.scaling;
+        let largest = (zoom.max / to_global.scaling).max(smallest);
+        let zoom_delta = zoom_delta.clamp(smallest, largest);
+
+        *to_global = *to_global
+            * TSTransform::from_translation(pointer_in_scene.to_vec2())
+            * TSTransform::from_scaling(zoom_delta)
+            * TSTransform::from_translation(-pointer_in_scene.to_vec2());
+
+        to_global.scaling = zoom.clamp(to_global.scaling);
+    }
+
+    *to_global = TSTransform::from_translation(pan_delta) * *to_global;
+    resp.mark_changed();
 }
 
 #[inline]
